@@ -22,16 +22,24 @@ print_separator() {
 # Usage/help
 show_help() {
         cat <<EOF
-Usage: $(basename "$0") [-s <source_dir>] [-g <game_path>] [-h]
+Usage: $(basename "$0") [-s <source_dir>] [-g <game_path>] [-d <deps_dir>] [-h]
 
 Options:
     -s <source_dir>   Use <source_dir> as the project/source directory (default: current directory)
     -g <game_path>    Directly use <game_path> as the game's install path (bypass interactive listing)
                                         If <game_path> points to a game root, the script will append BepInEx/plugins if needed.
+    -d <deps_dir>     Additional directory to search for DLLs listed in out.txt (can be used multiple times)
     -h                Show this help message
 
 If -g is not provided and the path in path.txt is invalid, the script will try to find Steam libraryfolders
 and list all installed games across all Steam libraries to let you pick a game.
+
+The script searches for DLLs in out.txt in this order:
+  1. Build output (bin/Release/*)
+  2. Dependencies folder
+  3. deps folder
+  4. Custom directories specified with -d
+  5. Current directory
 EOF
 }
 
@@ -42,14 +50,18 @@ CSPROJ_FILE=""
 # Defaults and CLI
 SRC_DIR="$(pwd)"
 FORCE_GAME_PATH=""
+CUSTOM_DEPS_DIRS=()
 
-while getopts ":g:s:h" opt; do
+while getopts ":g:s:d:h" opt; do
     case ${opt} in
         g )
             FORCE_GAME_PATH="$OPTARG"
             ;;
         s )
             SRC_DIR="$OPTARG"
+            ;;
+        d )
+            CUSTOM_DEPS_DIRS+=("$OPTARG")
             ;;
         h )
             show_help
@@ -312,9 +324,13 @@ fi
 
 # Check if out.txt exists and copy additional DLLs
 if [ -f "out.txt" ]; then
-    print_colored $YELLOW "📋 Found out.txt, copying additional DLLs..."
+    print_colored $YELLOW "📋 Found out.txt, processing additional DLLs..."
+    print_separator
     
-    while IFS= read -r dll_name; do
+    COPIED_COUNT=0
+    FAILED_COUNT=0
+    
+    while IFS= read -r dll_name || [ -n "$dll_name" ]; do
         # Skip empty lines
         if [ -z "$dll_name" ]; then
             continue
@@ -323,29 +339,87 @@ if [ -f "out.txt" ]; then
         # Remove any whitespace/newlines
         dll_name=$(echo "$dll_name" | tr -d '\n\r' | xargs)
         
-        # Find the DLL in build output
+        # Skip if empty after trimming
+        if [ -z "$dll_name" ]; then
+            continue
+        fi
+        
+        print_colored $CYAN "🔍 Searching for: $dll_name"
+        
+        # Search for DLL in multiple locations (in order of priority)
+        ADDITIONAL_DLL_PATH=""
+        SOURCE_LOCATION=""
+        
+        # 1. Check build output first
         ADDITIONAL_DLL_PATH=$(find . -name "$dll_name" -path "*/bin/Release/*" | head -1)
+        if [ -n "$ADDITIONAL_DLL_PATH" ]; then
+            SOURCE_LOCATION="build output"
+        fi
+        
+        # 2. If not in build output, check Dependencies folder
+        if [ -z "$ADDITIONAL_DLL_PATH" ] && [ -d "Dependencies" ]; then
+            ADDITIONAL_DLL_PATH=$(find Dependencies -name "$dll_name" -type f | head -1)
+            if [ -n "$ADDITIONAL_DLL_PATH" ]; then
+                SOURCE_LOCATION="Dependencies folder"
+            fi
+        fi
+        
+        # 3. If not in Dependencies, check deps folder
+        if [ -z "$ADDITIONAL_DLL_PATH" ] && [ -d "deps" ]; then
+            ADDITIONAL_DLL_PATH=$(find deps -name "$dll_name" -type f | head -1)
+            if [ -n "$ADDITIONAL_DLL_PATH" ]; then
+                SOURCE_LOCATION="deps folder"
+            fi
+        fi
+        
+        # 4. Check custom dependency directories specified with -d
+        if [ -z "$ADDITIONAL_DLL_PATH" ] && [ ${#CUSTOM_DEPS_DIRS[@]} -gt 0 ]; then
+            for custom_dir in "${CUSTOM_DEPS_DIRS[@]}"; do
+                if [ -d "$custom_dir" ]; then
+                    ADDITIONAL_DLL_PATH=$(find "$custom_dir" -name "$dll_name" -type f | head -1)
+                    if [ -n "$ADDITIONAL_DLL_PATH" ]; then
+                        SOURCE_LOCATION="custom directory ($custom_dir)"
+                        break
+                    fi
+                fi
+            done
+        fi
+        
+        # 5. If still not found, check current directory
+        if [ -z "$ADDITIONAL_DLL_PATH" ] && [ -f "$dll_name" ]; then
+            ADDITIONAL_DLL_PATH="$dll_name"
+            SOURCE_LOCATION="current directory"
+        fi
         
         if [ -n "$ADDITIONAL_DLL_PATH" ]; then
-            print_colored $BLUE "📄 Found additional DLL: $ADDITIONAL_DLL_PATH"
+            print_colored $BLUE "   ├─ Found in: $SOURCE_LOCATION"
+            print_colored $BLUE "   ├─ Path: $ADDITIONAL_DLL_PATH"
+            
             cp "$ADDITIONAL_DLL_PATH" "$TARGET_PATH/"
             
             if [ $? -eq 0 ]; then
-                print_colored $GREEN "✅ Copied $dll_name successfully"
+                print_colored $GREEN "   └─ ✅ Copied successfully!"
                 
                 # Show file info
                 COPIED_ADDITIONAL="$TARGET_PATH/$dll_name"
                 if [ -f "$COPIED_ADDITIONAL" ]; then
                     FILE_SIZE=$(du -h "$COPIED_ADDITIONAL" | cut -f1)
-                    print_colored $PURPLE "📊 $dll_name size: $FILE_SIZE"
+                    print_colored $PURPLE "      Size: $FILE_SIZE"
                 fi
+                ((COPIED_COUNT++))
             else
-                print_colored $RED "❌ Failed to copy $dll_name"
+                print_colored $RED "   └─ ❌ Failed to copy!"
+                ((FAILED_COUNT++))
             fi
         else
-            print_colored $YELLOW "⚠️  Could not find $dll_name in build output"
+            print_colored $RED "   └─ ❌ Not found in any search location"
+            ((FAILED_COUNT++))
         fi
+        echo ""
     done < out.txt
+    
+    print_separator
+    print_colored $CYAN "📊 Summary: $COPIED_COUNT copied, $FAILED_COUNT failed"
 else
     print_colored $BLUE "ℹ️  No out.txt found, skipping additional DLLs"
 fi
